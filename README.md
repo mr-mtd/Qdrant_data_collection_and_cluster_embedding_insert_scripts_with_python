@@ -53,3 +53,10 @@ enough pairs rather than stopping after a fixed 10 requests.
 
 Anonymous use is limited to 300 requests per IP per day; an API key from
 stackapps.com raises that to 10,000.
+
+
+After collection the data from stack overflow it is then organized for insert to honor BM25 and Symantic search and inserts all records into the vector DB
+
+The query script runs in terminal and prompts user for a query.
+
+Everything tested and working. Ready for RAG integration and testing. This repo/project is complete.
