@@ -1,37 +1,34 @@
 #!/usr/bin/env python3
-"""Export Stack Overflow ``apache-kafka`` questions paired with their accepted answers.
+"""Export 1,000 Stack Overflow ``apache-kafka`` questions paired with their accepted answers.
 
-Uses the Stack Exchange API v2.3 ``/questions`` endpoint with
-``site=stackoverflow``, ``tagged=apache-kafka`` and ``pagesize=100``. One page
-is fetched per request and at most 10 HTTP requests are made in total.
+Uses the Stack Exchange API v2.3 ``/search/advanced`` endpoint with
+``site=stackoverflow``, ``tagged=apache-kafka``, ``accepted=True`` and
+``pagesize=100``, sorted by votes. ``accepted=True`` makes the API return only
+questions that have an accepted answer, so almost every question on a page
+becomes a pair and about 10 to 11 requests reach 1,000 pairs.
+
+The script keeps requesting pages until it has 1,000 pairs (``--target``),
+the API reports ``has_more=false``, the daily quota runs out, or a safety cap
+of 25 requests is hit. The file is then trimmed to exactly ``--target`` pairs.
 
 A custom API filter makes each question come back with its ``body``, its
 ``accepted_answer_id`` and its nested ``answers`` (each with ``answer_id`` and
 ``body``), so both bodies arrive in the same request and no per-question calls
-are needed. Create that filter once with ``create_kafka_filter.py`` (see the
-README); this script reads it from ``--filter``, the ``SE_API_FILTER``
-environment variable, or the ``se_filter.txt`` file the setup script writes.
+are needed. The filter builds on the API's ``default`` filter, so the
+``has_more``, ``backoff`` and quota fields are always in the response. If no
+filter is given (``--filter`` or ``SE_API_FILTER``) and ``kafka_api_filter.txt``
+does not exist yet, the script creates it once via ``/2.3/filters/create``.
 
 Output: ``kafka_questions_and_answers.txt``, a UTF-8 JSON array of objects that
 each hold only ``question`` and ``accepted_answer`` as plain-text strings.
 
-Why 10 requests can give fewer than 1,000 pairs
------------------------------------------------
-``pagesize=100`` caps each page at 100 *questions*, not 100 question/answer
-pairs, so 10 requests return at most 1,000 questions. Only some of those become
-records:
-
-* Many questions have no accepted answer: they are unanswered, or the asker
-  never clicked "accept" (common for older or abandoned questions).
-* ``accepted_answer_id`` can point to an answer that is not in the nested
-  ``answers`` list (for example it was deleted), so there is no body to pair.
-* The API can report ``has_more=false`` before 10 pages are read, or a request
-  can fail (throttling, quota exhausted), which ends the run early.
-* The same question can appear on two pages if its rank shifts between
-  requests; duplicates are dropped.
-
-So the record count is "questions fetched that have a matching accepted
-answer", which is usually well under 1,000.
+Why a page can give fewer than 100 pairs
+----------------------------------------
+``pagesize=100`` caps each page at 100 *questions*, not 100 pairs. Even with
+``accepted=True``, a question is skipped when its accepted answer is missing
+from the nested ``answers`` (for example it was deleted) or a body is empty,
+and a question that shifts between pages is only counted once. That is why the
+script pages until it has enough pairs instead of stopping at 10 requests.
 
 Only the Python 3 standard library is used.
 """
@@ -55,10 +52,17 @@ API_ROOT = "https://api.stackexchange.com/2.3"
 SITE = "stackoverflow"
 TAG = "apache-kafka"
 PAGE_SIZE = 100
-MAX_REQUESTS = 10
+TARGET_PAIRS = 1000
+MAX_REQUESTS = 25  # safety cap; reaching 1,000 pairs normally takes ~10-11
+MAX_ATTEMPTS_PER_PAGE = 3
+RETRY_WAIT_SECONDS = 10
 REQUEST_TIMEOUT_SECONDS = 30
 OUTPUT_FILE = "kafka_questions_and_answers.txt"
-FILTER_FILE = "se_filter.txt"
+FILTER_FILE = "kafka_api_filter.txt"
+# Built on the "default" filter so has_more/backoff/quota fields are always
+# present; adds the bodies and the nested answers.
+FILTER_BASE = "default"
+FILTER_INCLUDE = ["question.body", "question.answers", "answer.body"]
 FILTER_ENV_VAR = "SE_API_FILTER"
 KEY_ENV_VAR = "SE_API_KEY"
 USER_AGENT = "kafka-qa-export/1.0 (python-urllib)"
@@ -265,22 +269,31 @@ def html_to_text(html: str) -> str:
 # --------------------------------------------------------------------------- #
 # Export
 # --------------------------------------------------------------------------- #
+def create_filter() -> str:
+    """Create the API filter via /2.3/filters/create (one request) and return it."""
+    data = get_json(
+        "/filters/create",
+        {"base": FILTER_BASE, "unsafe": "false", "include": ";".join(FILTER_INCLUDE)},
+    )
+    return data["items"][0]["filter"]
+
+
 def resolve_filter(cli_value: str | None) -> str:
-    """Pick the filter from --filter, then $SE_API_FILTER, then se_filter.txt."""
+    """Use --filter, then $SE_API_FILTER, then kafka_api_filter.txt; create it if absent."""
     if cli_value:
         return cli_value.strip()
     if os.environ.get(FILTER_ENV_VAR):
         return os.environ[FILTER_ENV_VAR].strip()
-    filter_path = Path(__file__).resolve().with_name(FILTER_FILE)
-    for path in (Path(FILTER_FILE), filter_path):
-        if path.is_file():
-            value = path.read_text(encoding="utf-8").strip()
-            if value:
-                return value
-    sys.exit(
-        "No API filter found. Run `python3 create_kafka_filter.py` once to create "
-        f"{FILTER_FILE}, or pass --filter / set {FILTER_ENV_VAR}."
-    )
+    path = Path(__file__).resolve().with_name(FILTER_FILE)
+    if path.is_file() and path.read_text(encoding="utf-8").strip():
+        return path.read_text(encoding="utf-8").strip()
+    try:
+        api_filter = create_filter()
+    except StackExchangeError as exc:
+        sys.exit(f"Could not create the API filter: {exc}")
+    path.write_text(api_filter + "\n", encoding="utf-8")
+    print(f"Created API filter {api_filter} and saved it to {path}")
+    return api_filter
 
 
 def pair_from_question(question: dict) -> dict | None:
@@ -301,21 +314,45 @@ def pair_from_question(question: dict) -> dict | None:
     return {"question": question_text, "accepted_answer": answer_text}
 
 
-def export(api_filter: str, api_key: str | None, output: Path) -> int:
+def fetch_page(params: dict[str, object], requests_left: int) -> tuple[dict | None, int]:
+    """Fetch one page, retrying transient failures. Returns (data, requests_used)."""
+    used = 0
+    for attempt in range(1, MAX_ATTEMPTS_PER_PAGE + 1):
+        if used >= requests_left:
+            break
+        used += 1
+        try:
+            return get_json("/search/advanced", params), used
+        except StackExchangeError as exc:
+            print(f"Page {params['page']} attempt {attempt} failed: {exc}", file=sys.stderr)
+            wait = RETRY_WAIT_SECONDS * attempt
+            match = re.search(r"available in (\d+) seconds", str(exc))
+            if match:  # throttle_violation tells us how long to wait
+                wait = int(match.group(1)) + 1
+            if attempt < MAX_ATTEMPTS_PER_PAGE and used < requests_left:
+                time.sleep(wait)
+    return None, used
+
+
+def export(api_filter: str, api_key: str | None, output: Path, target: int) -> int:
     records: list[dict] = []
     seen_ids: set[int] = set()
     backoff_seconds = 0
     questions_seen = 0
+    requests_made = 0
+    page = 0
 
-    for page in range(1, MAX_REQUESTS + 1):
+    while len(records) < target and requests_made < MAX_REQUESTS:
         if backoff_seconds:
             print(f"API asked for a backoff; waiting {backoff_seconds}s ...")
             time.sleep(backoff_seconds)
             backoff_seconds = 0
 
+        page += 1
         params: dict[str, object] = {
             "site": SITE,
             "tagged": TAG,
+            "accepted": "True",
             "pagesize": PAGE_SIZE,
             "page": page,
             "order": "desc",
@@ -325,10 +362,10 @@ def export(api_filter: str, api_key: str | None, output: Path) -> int:
         if api_key:
             params["key"] = api_key
 
-        try:
-            data = get_json("/questions", params)
-        except StackExchangeError as exc:
-            print(f"Request {page} failed, stopping early: {exc}", file=sys.stderr)
+        data, used = fetch_page(params, MAX_REQUESTS - requests_made)
+        requests_made += used
+        if data is None:
+            print(f"Giving up after page {page} kept failing.", file=sys.stderr)
             break
 
         items = data.get("items") or []
@@ -337,26 +374,45 @@ def export(api_filter: str, api_key: str | None, output: Path) -> int:
             qid = question.get("question_id")
             if qid in seen_ids:
                 continue
+            seen_ids.add(qid)
             pair = pair_from_question(question)
             if pair is not None:
-                seen_ids.add(qid)
                 records.append(pair)
 
+        quota = data.get("quota_remaining")
         print(
-            f"Request {page}/{MAX_REQUESTS}: {len(items)} questions, "
+            f"Page {page} (request {requests_made}): {len(items)} questions, "
             f"{len(records)} pairs so far"
-            + (f", quota remaining {data['quota_remaining']}" if "quota_remaining" in data else "")
+            + (f", quota remaining {quota}" if quota is not None else "")
         )
 
         backoff_seconds = int(data.get("backoff") or 0)
-        if not data.get("has_more"):
+        if "has_more" in data:
+            has_more = bool(data["has_more"])
+        else:
+            # Filter without has_more: assume more pages while pages are full.
+            if page == 1:
+                print(
+                    f"Warning: response has no has_more field; delete {FILTER_FILE} "
+                    "to recreate the filter.",
+                    file=sys.stderr,
+                )
+            has_more = len(items) == PAGE_SIZE
+        if not has_more:
             print("API reports has_more=false; no more pages.")
             break
+        if quota is not None and quota <= 0:
+            print("API quota exhausted; stopping. Try again tomorrow or use --key.")
+            break
 
+    if len(records) < target and requests_made >= MAX_REQUESTS:
+        print(f"Stopped at the safety cap of {MAX_REQUESTS} requests.")
+
+    records = records[:target]
     output.write_text(
         json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    print(f"Fetched {questions_seen} questions.")
+    print(f"Made {requests_made} API requests and fetched {questions_seen} questions.")
     print(f"Saved {len(records)} question/accepted-answer records to {output}")
     return len(records)
 
@@ -370,9 +426,13 @@ def main() -> None:
         help=f"optional API key for a higher daily quota (or set {KEY_ENV_VAR})",
     )
     parser.add_argument("--output", default=OUTPUT_FILE, help="output file path")
+    parser.add_argument(
+        "--target", type=int, default=TARGET_PAIRS,
+        help=f"number of pairs to collect (default {TARGET_PAIRS})",
+    )
     args = parser.parse_args()
 
-    export(resolve_filter(args.filter), args.key, Path(args.output))
+    export(resolve_filter(args.filter), args.key, Path(args.output), args.target)
 
 
 if __name__ == "__main__":
